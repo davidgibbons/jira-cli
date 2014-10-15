@@ -1,0 +1,325 @@
+#!/usr/bin/env ruby
+# This requires a jira password to be setup,
+# Even if you normally log in to JIRA using google authentication,
+# you will need to have a basic Atlassian ondemand password set up.
+# This is separate from your google credential and does not impact it.
+# https://confluence.atlassian.com/display/AOD/Changing+Your+Password+in+Atlassian+OnDemand
+#
+
+# Required Gems:
+# thor, colorize
+
+require 'thor'
+require 'yaml'
+require 'csv'
+require 'tempfile'
+require 'colorize'
+require 'mkmf'
+require 'pathname'
+
+# Begin actual cli logic
+class MyCLI < Thor
+  def initialize(*args)
+    super
+
+    # Pulling in settings
+    $settings_file = File.expand_path('~/.jira.yaml')
+    if File.exists?($settings_file)
+      @settings= YAML.load_file($settings_file)
+    else
+      config
+      settings_error("Cannot find #{$settings_file}")
+    end
+
+    # Set logical defaults
+    @settings['java_bin']             ||= 'java'
+    @settings['jira_jar']             ||= '~/jira/lib/jira-cli-3.8.0.jar'
+    @settings['session_file']         ||= '~/.jira_session'
+    @settings['default_request_type'] ||= 'Task'
+    if not Pathname.new(@settings['java_bin']).absolute? # if we don't have an absolute path for java lets find it
+      @settings['java_bin'] = find_executable(@settings['java_bin'])
+    end
+
+    # Error handling for settings we cant assume defaults on
+    ['user', 'passwd', 'jira_server', 'default_project'].each do |item|
+      if not @settings[item]
+        settings_error("Missing required entry #{item} from #{$settings_file}")
+        @settings[item] = 'error'
+      end
+    end
+    ['jira_jar', 'session_file'].each do |path|
+    	@settings[path] = File.expand_path(@settings[path])
+    end
+    if not File.exists?(@settings['jira_jar'])
+      puts settings_error("Missing: #{@settings['jira_jar']}")
+    end
+
+
+    # Commands run using the "soap" interface can use an auth token
+    # and may be faster than using credentials each time.
+    # This logic attempts to write and use a session file when possible.
+
+    @settings['session_file'] = File.expand_path(@settings['session_file'])
+    if not File.exists?(@settings['session_file']) or (Time.now - File.stat(@settings['session_file']).mtime).to_i > 1740 # 29 minutes
+      cmd = "--action login"
+      token = run_cmd(cmd, false)
+      File.open(@settings['session_file'], 'w') { |file| file.write(token) }
+    end
+  end
+
+  class_option :debug, :type => :boolean
+
+  ##
+  ## Create
+  ##
+  desc "create <summary>", "Create a new jira issue"
+  option :project, :aliases => :p, :banner => '<PROJECT>'
+  option :type,    :aliases => :t, :banner => '<TYPE>'
+  option :message, :aliases => :m, :banner => '<MESSAGE>'
+  def create(summary)
+    # It doesn't appear I can use a instance variable as a default in the options
+    # statement due to how the super is parsed, so check if we have one on the command line or use a default
+    project = options[:project] ? options[:project] : @settings['default_project']
+    type    = options[:type]    ? options[:type]    : @settings['default_request_type']
+
+    if options[:message]
+      cmd = "--action createIssue --project '#{project}' --type '#{type}' --summary '#{summary}' --description '#{options[:message]}'"
+    else
+      t = Tempfile.new('ThorCLI')
+      editor = ENV['EDITOR'] || '/usr/bin/env vim'
+      system(editor + ' ' + t.path)
+      cmd = "--action createIssue --project '#{project}' --type '#{type}' --summary '#{summary}' --file '#{t.path}'"
+    end
+    output = run_cmd(cmd)
+    puts output
+    t.unlink if t
+  end
+
+  ##
+  ## Time
+  ##
+  desc "time <issue> <ammount>", "Add time to a issue"
+  def time(ticket, time)
+    cmd = "--action addWork --issue '#{ticket}' --timeSpent '#{time}' --autoAdjust"
+    raw = run_cmd(cmd)
+    puts raw
+  end
+
+  ##
+  ## Comment
+  ##
+  desc "comment <issue>", "Comment on an issue"
+  option :message, :aliases => :m, :banner => '<MESSAGE>'
+  def comment(ticket)
+    if options[:message]
+      cmd = "--action addComment --issue '#{ticket}' --comment '#{options[:message]}'"
+    else
+      t = Tempfile.new('ThorCLI')
+      editor = ENV['EDITOR'] || '/usr/bin/env vim'
+      system(editor + ' ' + t.path)
+      cmd = "--action addComment --issue '#{ticket}' --file '#{t.path}'"
+    end
+    output = run_cmd(cmd)
+    puts output
+    t.unlink if t
+  end
+
+  ##
+  ## Assign
+  ##
+  desc "assign <issue>", "Assign an issue to a name"
+  option :name, :aliases => :n, :default => 'self', :banner => '<NAME>'
+  def assign(ticket)
+    if options[:name] == 'self'
+      user = @settings['user']
+    else
+      user = options[:name]
+    end
+    cmd = "--action assignIssue --issue #{ticket} --userId #{user}"
+    output = run_cmd(cmd)
+    puts output
+  end
+
+  ##
+  ## Close
+  ##
+  desc "close <issue>", "Attempt to close an issue"
+  def close(ticket)
+    if moveToState(ticket)
+      puts "Ticket: #{ticket} is closed."
+    end
+  end
+
+  ##
+  ## Move
+  ##
+  desc "move <transition> <issue>", "Attempt to move an issue to a transition"
+  def move(title, ticket)
+    if @settings['transitions'][title].nil?
+      settings_error("Unable to find transition #{title}")
+    end
+    @settings['transitions'][title]['resolution'] ||= "completed"
+    ['final_state', 'intrim_states'].each do |val|
+      val || settings_error("Missing #{val} for transition #{title}")
+    end
+    moveToState(
+      ticket,
+      @settings['transitions'][title]['final_state'],
+      @settings['transitions'][title]['intrim_state'],
+      @settings['transitions'][title]['resolution']
+      )
+  end
+
+  ##
+  ## View
+  ##
+  desc "view <issue>", "View an existing jira issue"
+  def view(ticket)
+    cmd = "--action getIssueList --search 'issue = #{ticket}' --columns='Status,Priority,Assignee,Reporter,Summary'"
+    link= "#{@settings['jira_server']}/browse/#{ticket}"
+    raw = run_cmd(cmd)
+    res = CSV.parse(raw)
+    res[1].each {|label| label.downcase! }
+    data =  Hash[ *res[1].zip(res[2]).flatten ]
+    if defined?("".colorize)
+      data['status'] = data['status'].colorize(:red)
+      data['status'] = data['status'].colorize(:green) if data['status'] =~ /close/
+      link = link.underline
+    end
+    template = <<-EOF
+    status               : #{data['status'].gsub( /\W\(\d*\)/ ,'')}
+    reporter             : #{data['reporter']}
+    summary              : #{data['summary']}
+    assignee             : #{data['assignee']}
+    priority             : #{data['priority'].gsub( /\W\(\d*\)/ ,'')}
+    link                 : #{link}
+    issue                : #{ticket}
+    EOF
+    puts template
+  end
+
+  ##
+  ## Search
+  ## TODO
+  desc "search <text>", "Search for matches jiras"
+  def search(text)
+    puts "this command needs work"
+    #cmd = "--action getIssueList --search '#{text}' --columns='Status,Priority,Assignee,Reporter,Summary'"
+    #raw = run_cmd(cmd)
+    #res = CSV.parse(raw)
+    #puts res
+
+  end
+
+  ##
+  ## Config
+  ##
+  desc "config", "Print out an example config"
+  def config(*args)
+  	puts "Please add the following to #{$settings_file}"
+    puts """---
+user: dag
+passwd: password
+java_bin: /usr/local/bin/java
+jira_jar: ~/jira/lib/jira-cli-3.8.0.jar
+jira_server: https://yourdomain.atlassian.net
+default_project: PROJECTNAME
+transitions:
+  close:
+    final_state: 6      # Id of the final state we want to get to
+    intrim_state:
+      - 421    # pre states we might be in to get there
+      - 261
+      - 471
+      - 61
+    resolution: completed
+"""
+    puts
+  end
+
+  ##
+  ## Private methods
+  ##
+  no_commands do
+    def getSteps(ticket)
+      """
+      Returns the available steps of a ticket
+      returns list of step ids
+      """
+      cmd = "--action getAvailableSteps --issue #{ticket}"
+      raw = run_cmd(cmd)
+      res = CSV.parse(raw)
+      res.shift
+      res.shift
+      data = []
+      res.each do |id,label|
+        data.push(id.to_i)
+      end
+      return data
+    end
+
+    def moveToState(ticket, final_state, intrim_states, resolution)
+      """
+      Business Logic to move a ticket through multiple steps to a status.
+      Returns True based on success, loops poorly on failure
+      """
+      status = getStatus(ticket)
+      if status == final_state
+        return true # do nothing if ticket already in the right state.
+      else
+        steps = getSteps(ticket)
+        new_step = (steps & intrim_states )[0]
+        if not new_step.nil?
+          moveStep(ticket, new_step, resolution)
+        else
+          moveStep(ticket, new_step)
+        end
+        moveToState(ticket, final_state, intrim_states, resolution)
+      end
+      return false
+    end
+
+    def moveStep(ticket, step, resolution=nil)
+      if resolution
+        cmd = "--action progressIssue  --issue #{ticket}  --step '#{step}' --resolution '#{resolution}'"
+      else
+        cmd = "--action progressIssue  --issue #{ticket}  --step '#{step}'"
+      end
+      output = run_cmd(cmd)
+      puts output
+    end
+
+
+    def run_cmd(cmd, login=true)
+      puts cmd if options[:debug]
+      if login
+        output = %x[#{@settings['java_bin']} -jar #{@settings['jira_jar']} --server #{@settings['jira_server']} --user=#{@settings['user']} --password=#{@settings['passwd']} #{cmd} -l < #{@settings['session_file']} ]
+      else
+        output = %x[#{@settings['java_bin']} -jar #{@settings['jira_jar']} --server #{@settings['jira_server']} --user=#{@settings['user']} --password=#{@settings['passwd']} #{cmd} ]
+      end
+      return output
+    end
+
+    # lame error handling
+    def settings_error(error)
+      puts error
+      exit 1
+    end
+
+    def getStatus(ticket)
+      """
+      Returns the current status id, eg closed returns 6
+      """
+      cmd = "--action getFieldValue --issue #{ticket} --field status"
+      raw = run_cmd(cmd)
+      res = CSV.parse(raw)
+      res.shift
+      id = /\((\d+)\)/.match(res[0].to_s)[1]
+      return id.to_i
+    end
+  end
+end
+
+
+
+MyCLI.start(ARGV)
